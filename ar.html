@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>陸運會跳遠 WebXR AR 自動快照測量系統</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100vw; height: 100vh; overflow: hidden;
+      background-color: #000; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    /* AR DOM Overlay */
+    #xr-overlay {
+      position: fixed; top: 0; left: 0;
+      width: 100vw; height: 100vh; z-index: 9999;
+      display: flex; flex-direction: column;
+      justify-content: space-between; align-items: center;
+      padding: 25px 20px; pointer-events: none;
+    }
+
+    .interactive { pointer-events: auto; }
+
+    #info-card {
+      background: rgba(0, 0, 0, 0.85); color: #fff;
+      padding: 14px 22px; border-radius: 20px;
+      font-size: 15px; font-weight: bold; text-align: center;
+      max-width: 90%; backdrop-filter: blur(8px);
+      border: 1px solid rgba(255,255,255,0.2);
+      box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+    }
+
+    #controls {
+      display: flex; gap: 12px; width: 100%;
+      max-width: 400px; justify-content: center;
+    }
+
+    .btn {
+      flex: 1; padding: 16px 10px; font-size: 16px; font-weight: 900;
+      color: #fff; border: none; border-radius: 30px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.5); cursor: pointer; text-align: center;
+      transition: all 0.2s;
+    }
+    .btn:active { transform: scale(0.95); }
+
+    #btn-start { background: #007bff; width: 100%; max-width: 220px; }
+    #btn-set-start { background: #ff0055; display: none; }
+    #btn-reset { background: #ffcc00; color: #000; display: none; }
+
+    /* 彈出相片結果卡片 */
+    #result-modal {
+      position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+      background: rgba(0,0,0,0.9); z-index: 10000;
+      display: none; flex-direction: column;
+      justify-content: center; align-items: center; padding: 20px;
+    }
+    #result-img {
+      max-width: 100%; max-height: 70vh;
+      border-radius: 12px; border: 3px solid #00ff88;
+      box-shadow: 0 0 20px rgba(0,255,136,0.4);
+    }
+    #result-title {
+      color: #00ff88; font-size: 22px; font-weight: bold; margin: 15px 0 10px;
+    }
+  </style>
+
+  <!-- Three.js 庫 -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+
+  <!-- AR DOM Overlay -->
+  <div id="xr-overlay">
+    <div id="info-card" class="interactive">請點擊下方「開啟 AR 自動測量」按鈕</div>
+    <div id="controls" class="interactive">
+      <button id="btn-start" class="btn">開啟 AR 自動測量</button>
+      <button id="btn-set-start" class="btn">標記起跳線</button>
+      <button id="btn-reset" class="btn">重置 (測下一位)</button>
+    </div>
+  </div>
+
+  <!-- 相片紀錄 Modal -->
+  <div id="result-modal">
+    <div id="result-title">🎯 著地快照與成績繪製</div>
+    <img id="result-img" src="" alt="跳遠測量快照">
+    <button id="btn-close-modal" class="btn interactive" style="background:#007bff; margin-top:15px; max-width:200px;">關閉並重置</button>
+  </div>
+
+  <script>
+    let camera, scene, renderer;
+    let xrRefSpace, hitTestSource = null;
+    let reticle;
+
+    // 3D 空間座標
+    let startLinePos = null;
+    let landingPos = null;
+
+    // 3D 視覺物件
+    let startLineMesh = null;
+    let landingMarkerMesh = null;
+    let distLineMesh = null;
+
+    // 自動偵測狀態
+    let isDetecting = false;
+    let isCaptured = false;
+    let stabilityCounter = 0;
+    let lastReticlePos = new THREE.Vector3();
+
+    const btnStart = document.getElementById('btn-start');
+    const btnSetStart = document.getElementById('btn-set-start');
+    const btnReset = document.getElementById('btn-reset');
+    const infoCard = document.getElementById('info-card');
+    const overlay = document.getElementById('xr-overlay');
+    const resultModal = document.getElementById('result-modal');
+    const resultImg = document.getElementById('result-img');
+    const btnCloseModal = document.getElementById('btn-close-modal');
+
+    // 環境確認
+    window.addEventListener('DOMContentLoaded', () => {
+      if (!window.isSecureContext) {
+        infoCard.style.color = '#ff6b6b';
+        infoCard.innerText = "❌ 錯誤：必須在 HTTPS 環境下執行！";
+        btnStart.disabled = true;
+      } else if (!navigator.xr) {
+        infoCard.style.color = '#ff6b6b';
+        infoCard.innerText = "❌ 錯誤：請使用 Android Chrome 瀏覽器";
+        btnStart.disabled = true;
+      }
+    });
+
+    // 1. 啟動 WebXR Session (開啟可抓取 Canvas 的選項)
+    btnStart.addEventListener('click', async () => {
+      try {
+        infoCard.innerText = "正在初始化 AR 空間...";
+
+        scene = new THREE.Scene();
+        camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+        renderer = new THREE.WebGLRenderer({
+          antialias: true,
+          alpha: true,
+          preserveDrawingBuffer: true // 允許畫面快照截圖
+        });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.xr.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+        scene.add(light);
+
+        // 地面瞄準環
+        const ringGeo = new THREE.RingGeometry(0.04, 0.05, 32).rotateX(-Math.PI / 2);
+        const ringMat = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+        reticle = new THREE.Mesh(ringGeo, ringMat);
+        reticle.matrixAutoUpdate = false;
+        reticle.visible = false;
+        scene.add(reticle);
+
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['hit-test', 'local-floor'],
+          optionalFeatures: ['dom-overlay'],
+          domOverlay: { root: overlay }
+        });
+
+        renderer.xr.setSession(session);
+
+        btnStart.style.display = 'none';
+        btnSetStart.style.display = 'block';
+        infoCard.innerText = "瞄準【起跳線】按下「標記起跳線」";
+
+        const viewerSpace = await session.requestReferenceSpace('viewer');
+        hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+        xrRefSpace = await session.requestReferenceSpace('local-floor');
+
+        renderer.setAnimationLoop(renderLoop);
+
+      } catch (err) {
+        infoCard.innerText = "啟動 AR 失敗: " + err.message;
+      }
+    });
+
+    // 2. 標記起跳線並開啟「自動偵測著地」
+    btnSetStart.addEventListener('click', () => {
+      if (reticle && reticle.visible) {
+        startLinePos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+
+        // 建立紅色起跳線 (3D)
+        const lineGeo = new THREE.BoxGeometry(3.0, 0.01, 0.06);
+        const lineMat = new THREE.MeshBasicMaterial({ color: 0xff0055 });
+        startLineMesh = new THREE.Mesh(lineGeo, lineMat);
+        startLineMesh.position.copy(startLinePos);
+        scene.add(startLineMesh);
+
+        btnSetStart.style.display = 'none';
+        isDetecting = true;
+
+        infoCard.innerText = "🟢 已鎖定起跳線！請運動員跳躍，系統將自動偵測著地瞬間並拍照...";
+        infoCard.style.color = "#00ff88";
+      } else {
+        alert("未偵測到地面！請先移動手機對準地面。");
+      }
+    });
+
+    // 3. AR 渲染循環 + 自動著地判定
+    function renderLoop(timestamp, frame) {
+      if (frame) {
+        const hitTestResults = frame.getHitTestResults(hitTestSource);
+        if (hitTestResults.length > 0) {
+          const hit = hitTestResults[0];
+          const pose = hit.getPose(xrRefSpace);
+          reticle.visible = true;
+          reticle.matrix.fromArray(pose.transform.matrix);
+
+          const currentReticlePos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+
+          // 自動偵測著地邏輯：
+          // 當鏡頭對準起跳線前方沙坑，且著地點的准心空間位置穩定（運動員腳著地停頓）
+          if (isDetecting && !isCaptured && startLinePos) {
+            const distFromStart = startLinePos.distanceTo(currentReticlePos);
+
+            // 確定位置是在起跳線前方（距離 > 0.5m）
+            if (distFromStart > 0.5) {
+              const moveDiff = currentReticlePos.distanceTo(lastReticlePos);
+
+              // 如果焦點變動極小（代表腳踩在沙坑上停頓瞬間）
+              if (moveDiff < 0.015) {
+                stabilityCounter++;
+                if (stabilityCounter > 12) { // 連續穩定約 0.2 秒
+                  isCaptured = true;
+                  landingPos = currentReticlePos.clone();
+                  triggerAutoCapture();
+                }
+              } else {
+                stabilityCounter = 0;
+              }
+            }
+            lastReticlePos.copy(currentReticlePos);
+          }
+        } else {
+          reticle.visible = false;
+        }
+      }
+      renderer.render(scene, camera);
+    }
+
+    // 4. 自動觸發：畫 3D 連線 + 拍照繪製成績圖
+    function triggerAutoCapture() {
+      // 1. 建立著地點黃色圓盤
+      const cylinderGeo = new THREE.CylinderGeometry(0.1, 0.1, 0.02, 32);
+      const cylinderMat = new THREE.MeshBasicMaterial({ color: 0xffcc00 });
+      landingMarkerMesh = new THREE.Mesh(cylinderGeo, cylinderMat);
+      landingMarkerMesh.position.copy(landingPos);
+      scene.add(landingMarkerMesh);
+
+      // 2. 建立綠色起終點 3D 連線
+      const points = [startLinePos, landingPos];
+      const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
+      const lineMat = new THREE.LineBasicMaterial({ color: 0x00ff88, linewidth: 8 });
+      distLineMesh = new THREE.Line(lineGeo, lineMat);
+      scene.add(distLineMesh);
+
+      // 計算 3D 公分/公尺距離
+      const distMeters = startLinePos.distanceTo(landingPos);
+      const distCm = (distMeters * 100).toFixed(1);
+
+      infoCard.innerText = `🎯 捕捉成功！成績：${distCm} cm (${distMeters.toFixed(2)} m)`;
+
+      // 3. 延遲 100ms 確保 3D 物件已渲染後拍攝並標註照片
+      setTimeout(() => {
+        captureAndDrawSnapshot(distCm, distMeters.toFixed(2));
+      }, 100);
+    }
+
+    // 5. 畫面合成：在相片上標註「起點、終點、路線、距離」
+    function captureAndDrawSnapshot(distCm, distM) {
+      const webglCanvas = renderer.domElement;
+
+      // 創建合成 Canvas
+      const canvas = document.createElement('canvas');
+      canvas.width = webglCanvas.width;
+      canvas.height = webglCanvas.height;
+      const ctx = canvas.getContext('2d');
+
+      // 貼上當前 AR 畫面
+      ctx.drawImage(webglCanvas, 0, 0);
+
+      // 計算 3D 點在 2D 螢幕畫面上的座標
+      const start2D = project3DTo2D(startLinePos);
+      const landing2D = project3DTo2D(landingPos);
+
+      // --- A. 畫「起點至終點」路線 (綠色虛線 + 實線) ---
+      ctx.beginPath();
+      ctx.moveTo(start2D.x, start2D.y);
+      ctx.lineTo(landing2D.x, landing2D.y);
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = '#00ff88';
+      ctx.shadowColor = 'rgba(0,0,0,0.8)';
+      ctx.shadowBlur = 8;
+      ctx.stroke();
+
+      // --- B. 畫「起跳線」標記 (紅色圈) ---
+      ctx.beginPath();
+      ctx.arc(start2D.x, start2D.y, 12, 0, Math.PI * 2);
+      ctx.fillStyle = '#ff0055';
+      ctx.fill();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = '#ffffff';
+      ctx.stroke();
+
+      // --- C. 畫「著地點第一下」標記 (黃色圈) ---
+      ctx.beginPath();
+      ctx.arc(landing2D.x, landing2D.y, 14, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffcc00';
+      ctx.fill();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = '#000000';
+      ctx.stroke();
+
+      // --- D. 標註文字說明 ---
+      ctx.font = 'Bold 20px sans-serif';
+      ctx.fillStyle = '#ff0055';
+      ctx.fillText('起點', start2D.x + 15, start2D.y - 15);
+
+      ctx.fillStyle = '#ffcc00';
+      ctx.fillText('著地點 (第一下)', landing2D.x + 18, landing2D.y + 5);
+
+      // --- E. 繪製成績數據看板 (圖片中央上方) ---
+      const midX = canvas.width / 2;
+      const cardY = 80;
+
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+      ctx.roundRect(midX - 160, cardY - 40, 320, 80, 20);
+      ctx.fill();
+      ctx.strokeStyle = '#00ff88';
+      ctx.lineWidth = 4;
+      ctx.stroke();
+
+      ctx.font = 'Bold 36px sans-serif';
+      ctx.fillStyle = '#00ff88';
+      ctx.textAlign = 'center';
+      ctx.fillText(`${distCm} cm`, midX, cardY + 12);
+
+      // 轉為 Base64 圖片並顯示彈出視窗
+      resultImg.src = canvas.toDataURL('image/png');
+      resultModal.style.display = 'flex';
+      btnReset.style.display = 'block';
+    }
+
+    // 將 3D 空間座標轉換為 2D 螢幕像素座標
+    function project3DTo2D(pos3D) {
+      const clonePos = pos3D.clone();
+      clonePos.project(camera);
+      return {
+        x: (clonePos.x + 1) * window.innerWidth / 2,
+        y: (-clonePos.y + 1) * window.innerHeight / 2
+      };
+    }
+
+    // 關閉 Modal 與重置
+    btnCloseModal.addEventListener('click', () => {
+      resultModal.style.display = 'none';
+      resetMeasurement();
+    });
+
+    btnReset.addEventListener('click', resetMeasurement);
+
+    function resetMeasurement() {
+      if (startLineMesh) scene.remove(startLineMesh);
+      if (landingMarkerMesh) scene.remove(landingMarkerMesh);
+      if (distLineMesh) scene.remove(distLineMesh);
+
+      startLinePos = null;
+      landingPos = null;
+      isDetecting = false;
+      isCaptured = false;
+      stabilityCounter = 0;
+
+      btnReset.style.display = 'none';
+      btnSetStart.style.display = 'block';
+      infoCard.style.color = '#ffffff';
+      infoCard.innerText = "已重置。請瞄準【起跳線】按下「標記起跳線」";
+    }
+  </script>
+</body>
+</html>
