@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>陸運會跳遠 AI 測量系統 (含校正功能)</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0;
+      width: 100vw; height: 100vh;
+      overflow: hidden; background-color: #000;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    #video-feed {
+      position: absolute; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      object-fit: cover; z-index: 1;
+    }
+
+    #draw-canvas {
+      position: absolute; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      z-index: 2; pointer-events: none;
+    }
+
+    /* 控制列 UI */
+    #ui-container {
+      position: fixed; top: 0; left: 0;
+      width: 100%; height: 100%;
+      pointer-events: none; z-index: 10;
+      display: flex; flex-direction: column;
+      justify-content: space-between; padding: 15px 25px;
+    }
+
+    .interactive { pointer-events: auto; }
+
+    #top-bar {
+      display: flex; justify-content: space-between; align-items: center;
+      background: rgba(0, 0, 0, 0.85); color: #fff;
+      padding: 10px 20px; border-radius: 30px;
+      backdrop-filter: blur(8px); border: 1px solid rgba(255,255,255,0.2);
+    }
+
+    #status-text { font-size: 15px; font-weight: bold; color: #00ffcc; }
+    #ai-state { font-size: 13px; color: #ffcc00; }
+
+    #action-btn-container {
+      position: absolute; right: 30px; top: 50%;
+      transform: translateY(-50%); display: flex; flex-direction: column; gap: 12px;
+    }
+
+    .btn {
+      background: #00ffcc; color: #000;
+      font-size: 16px; font-weight: 900;
+      border: none; padding: 14px 28px; border-radius: 40px;
+      cursor: pointer; box-shadow: 0 4px 15px rgba(0,255,204,0.4);
+      transition: all 0.2s;
+    }
+    .btn:active { transform: scale(0.95); }
+    .btn-calib { background: #ff9900; color: #fff; box-shadow: 0 4px 15px rgba(255,153,0,0.4); }
+    .btn-again { background: #ffcc00; color: #000; display: none; }
+
+    /* 校正介面 Overlay */
+    #calib-panel {
+      display: none; position: fixed; bottom: 20px; left: 50%;
+      transform: translateX(-50%); background: rgba(0,0,0,0.9);
+      color: #fff; padding: 15px 25px; border-radius: 20px;
+      z-index: 30; border: 2px solid #ff9900; text-align: center;
+    }
+    #calib-panel input {
+      width: 80px; font-size: 16px; padding: 5px; text-align: center;
+      border-radius: 8px; border: none; font-weight: bold; margin: 0 5px;
+    }
+
+    /* 成果照片 Modal */
+    #photo-modal {
+      display: none; position: fixed; top: 0; left: 0;
+      width: 100vw; height: 100vh; background: rgba(0,0,0,0.92);
+      z-index: 100; flex-direction: column; align-items: center; justify-content: center;
+      padding: 15px;
+    }
+
+    #captured-image {
+      max-width: 90%; max-height: 75vh;
+      border: 3px solid #00ffcc; border-radius: 12px;
+      box-shadow: 0 0 30px rgba(0,255,204,0.3);
+    }
+
+    #rotate-banner {
+      display: none; position: fixed; top: 10px; left: 50%;
+      transform: translateX(-50%); background: #ffcc00; color: #000;
+      padding: 6px 16px; border-radius: 20px; font-weight: bold; font-size: 13px;
+      z-index: 20; box-shadow: 0 2px 10px rgba(0,0,0,0.5);
+    }
+  </style>
+
+  <!-- Google MediaPipe Pose 庫 -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+  <div id="rotate-banner">🔄 請開啟自動旋轉並將手機橫放</div>
+
+  <video id="video-feed" playsinline muted></video>
+  <canvas id="draw-canvas"></canvas>
+
+  <!-- UI 介面 -->
+  <div id="ui-container">
+    <div id="top-bar">
+      <div>
+        <span style="font-size: 11px; color: #aaa;">陸運會跳遠 AI 測量系統</span>
+        <div id="status-text">對準起跳線後按 Ready；點 Calibrate 可校正距離</div>
+      </div>
+      <div id="ai-state">相機初始化中...</div>
+    </div>
+
+    <div id="action-btn-container" class="interactive">
+      <button id="btn-ready" class="btn">Ready</button>
+      <button id="btn-calib" class="btn btn-calib">Calibrate</button>
+      <button id="btn-again" class="btn btn-again">Again</button>
+    </div>
+  </div>
+
+  <!-- 校正設定面板 -->
+  <div id="calib-panel" class="interactive">
+    <div>已知參考物實際長度：<input type="number" id="input-ref-len" value="60"> cm</div>
+    <div style="font-size: 12px; color: #aaa; margin: 8px 0;">請在螢幕上點擊/拖曳兩條橙色線對準參考物兩端</div>
+    <button id="btn-save-calib" class="btn btn-calib" style="padding: 6px 20px; font-size: 14px;">Save (儲存校正)</button>
+  </div>
+
+  <!-- 照片導出視窗 -->
+  <div id="photo-modal">
+    <h3 style="color: #00ffcc; margin: 0 0 10px 0;">📸 已記錄落地瞬間！</h3>
+    <img id="captured-image" src="" alt="跳遠紀錄">
+    <button id="btn-modal-again" class="btn btn-again interactive" style="display: block; margin-top: 15px;">Again (測量下一位)</button>
+  </div>
+
+  <script>
+    const videoElement = document.getElementById('video-feed');
+    const canvasElement = document.getElementById('draw-canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+
+    const btnReady = document.getElementById('btn-ready');
+    const btnCalib = document.getElementById('btn-calib');
+    const btnSaveCalib = document.getElementById('btn-save-calib');
+    const btnAgain = document.getElementById('btn-again');
+    const btnModalAgain = document.getElementById('btn-modal-again');
+    const statusText = document.getElementById('status-text');
+    const aiState = document.getElementById('ai-state');
+    const calibPanel = document.getElementById('calib-panel');
+    const rotateBanner = document.getElementById('rotate-banner');
+
+    let isReady = false;
+    let isCaptured = false;
+    let isCalibrating = false;
+
+    let startLineXRatio = 0.35; // 起跳線比例
+
+    // 校正線座標 (比例 0~1)
+    let calibX1Ratio = 0.45;
+    let calibX2Ratio = 0.60;
+    let draggingLine = null;
+
+    // 動態像素轉換比例 (預設依地墊修正為 0.21)
+    let CM_PER_PIXEL = 0.21;
+
+    let poseDetector = null;
+    let lastFeetX = 0;
+    let feetVelocity = 0;
+    let personInAir = false;
+
+    window.addEventListener('load', initApp);
+
+    async function initApp() {
+      resizeCanvas();
+      checkOrientation();
+
+      window.addEventListener('resize', () => {
+        resizeCanvas();
+        checkOrientation();
+      });
+
+      // 觸控/滑鼠拖曳校正線事件
+      window.addEventListener('pointerdown', onPointerDown);
+      window.addEventListener('pointermove', onPointerMove);
+      window.addEventListener('pointerup', () => draggingLine = null);
+
+      // 1. 初始化 AI 人體姿態模型
+      poseDetector = new Pose({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+      });
+
+      poseDetector.setOptions({
+        modelComplexity: 1,
+        smoothLandmarks: true,
+        minDetectionConfidence: 0.65,
+        minTrackingConfidence: 0.65
+      });
+
+      poseDetector.onResults(onPoseResults);
+
+      // 2. 開啟後置鏡頭
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: "environment" },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 }
+          },
+          audio: false
+        });
+
+        videoElement.srcObject = stream;
+        await videoElement.play();
+
+        const processFrame = async () => {
+          if (isReady && !isCaptured && !isCalibrating && videoElement.readyState >= 2) {
+            await poseDetector.send({ image: videoElement });
+          }
+          requestAnimationFrame(processFrame);
+        };
+        processFrame();
+
+        aiState.innerText = "後置鏡頭就續";
+      } catch (e) {
+        aiState.innerText = "❌ 鏡頭錯誤: " + e.message;
+      }
+
+      btnReady.addEventListener('click', handleReady);
+      btnCalib.addEventListener('click', startCalibration);
+      btnSaveCalib.addEventListener('click', saveCalibration);
+      btnAgain.addEventListener('click', handleAgain);
+      btnModalAgain.addEventListener('click', handleAgain);
+
+      requestAnimationFrame(renderLoop);
+    }
+
+    function checkOrientation() {
+      rotateBanner.style.display = (window.innerHeight > window.innerWidth) ? 'block' : 'none';
+    }
+
+    function resizeCanvas() {
+      canvasElement.width = window.innerWidth;
+      canvasElement.height = window.innerHeight;
+    }
+
+    // --- 校正（Calibration）邏輯 ---
+    function startCalibration() {
+      isCalibrating = true;
+      calibPanel.style.display = 'block';
+      btnReady.style.display = 'none';
+      btnCalib.style.display = 'none';
+      statusText.innerText = "⚙️ 校正模式：請拖曳兩條橙色線至參考物兩端";
+      statusText.style.color = "#ff9900";
+    }
+
+    function saveCalibration() {
+      const realCm = parseFloat(document.getElementById('input-ref-len').value) || 60;
+      const pixelDiff = Math.abs(calibX2Ratio - calibX1Ratio) * canvasElement.width;
+
+      if (pixelDiff > 5) {
+        CM_PER_PIXEL = realCm / pixelDiff;
+        alert(`✅ 校正成功！目前比例：1 像素 = ${CM_PER_PIXEL.toFixed(4)} cm`);
+      } else {
+        alert("❌ 校正線距離過近，請重新拖曳對準！");
+        return;
+      }
+
+      isCalibrating = false;
+      calibPanel.style.display = 'none';
+      btnReady.style.display = 'block';
+      btnCalib.style.display = 'block';
+      statusText.innerText = "對準起跳線後按 Ready；點 Calibrate 可校正距離";
+      statusText.style.color = "#00ffcc";
+    }
+
+    // 校正線拖曳觸控事件
+    function onPointerDown(e) {
+      if (!isCalibrating) return;
+      const x = e.clientX;
+      const x1 = calibX1Ratio * canvasElement.width;
+      const x2 = calibX2Ratio * canvasElement.width;
+
+      if (Math.abs(x - x1) < 30) draggingLine = 'line1';
+      else if (Math.abs(x - x2) < 30) draggingLine = 'line2';
+    }
+
+    function onPointerMove(e) {
+      if (!isCalibrating || !draggingLine) return;
+      const ratio = e.clientX / canvasElement.width;
+      if (draggingLine === 'line1') calibX1Ratio = Math.max(0.05, Math.min(ratio, calibX2Ratio - 0.02));
+      if (draggingLine === 'line2') calibX2Ratio = Math.min(0.95, Math.max(ratio, calibX1Ratio + 0.02));
+    }
+
+    // --- 系統控制與繪圖 ---
+    function handleReady() {
+      isReady = true;
+      btnReady.style.display = 'none';
+      btnCalib.style.display = 'none';
+      btnAgain.style.display = 'block';
+
+      statusText.innerText = "🔒 起跳線已鎖定！AI 正在監控跳遠...";
+      statusText.style.color = "#ff0055";
+      aiState.innerText = "等待運動員起跳...";
+    }
+
+    function handleAgain() {
+      isReady = false;
+      isCaptured = false;
+      personInAir = false;
+
+      document.getElementById('photo-modal').style.display = 'none';
+      btnReady.style.display = 'block';
+      btnCalib.style.display = 'block';
+      btnAgain.style.display = 'none';
+
+      statusText.innerText = "對準起跳線後按 Ready；點 Calibrate 可校正距離";
+      statusText.style.color = "#00ffcc";
+      aiState.innerText = "請按 Ready 鎖定起跳線";
+
+      requestAnimationFrame(renderLoop);
+    }
+
+    function renderLoop() {
+      canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+      // 繪製校正線
+      if (isCalibrating) {
+        const x1 = calibX1Ratio * canvasElement.width;
+        const x2 = calibX2Ratio * canvasElement.width;
+
+        // 校正線 1
+        canvasCtx.beginPath();
+        canvasCtx.strokeStyle = "#ff9900";
+        canvasCtx.lineWidth = 4;
+        canvasCtx.moveTo(x1, 0); canvasCtx.lineTo(x1, canvasElement.height);
+        canvasCtx.stroke();
+
+        // 校正線 2
+        canvasCtx.beginPath();
+        canvasCtx.strokeStyle = "#ff9900";
+        canvasCtx.lineWidth = 4;
+        canvasCtx.moveTo(x2, 0); canvasCtx.lineTo(x2, canvasElement.height);
+        canvasCtx.stroke();
+      } else {
+        const xPos = startLineXRatio * canvasElement.width;
+
+        if (!isReady) {
+          // 未 Ready：對準綠色虛線
+          canvasCtx.beginPath();
+          canvasCtx.strokeStyle = "#00ffcc";
+          canvasCtx.lineWidth = 5;
+          canvasCtx.setLineDash([20, 12]);
+          canvasCtx.moveTo(xPos, 0); canvasCtx.lineTo(xPos, canvasElement.height);
+          canvasCtx.stroke();
+          canvasCtx.setLineDash([]);
+        } else if (!isCaptured) {
+          // 已 Ready：紅色鎖定線
+          canvasCtx.beginPath();
+          canvasCtx.strokeStyle = "#ff0055";
+          canvasCtx.lineWidth = 6;
+          canvasCtx.moveTo(xPos, 0); canvasCtx.lineTo(xPos, canvasElement.height);
+          canvasCtx.stroke();
+        }
+      }
+
+      if (!isCaptured) requestAnimationFrame(renderLoop);
+    }
+
+    // AI 著地識別
+    function onPoseResults(results) {
+      if (!isReady || isCaptured || isCalibrating) return;
+
+      if (results.poseLandmarks) {
+        const landmarks = results.poseLandmarks;
+
+        const nose = landmarks[0];
+        const leftHeel = landmarks[29];
+        const rightHeel = landmarks[30];
+
+        const isHumanDetected = (nose.visibility > 0.5) && 
+                                (leftHeel.visibility > 0.5 || rightHeel.visibility > 0.5);
+
+        if (!isHumanDetected) return;
+
+        aiState.innerText = "🏃 捕捉到運動員！";
+
+        const heelX = Math.min(leftHeel.x, rightHeel.x);
+        const heelY = leftHeel.x < rightHeel.x ? leftHeel.y : rightHeel.y;
+
+        feetVelocity = Math.abs(heelX - lastFeetX);
+        lastFeetX = heelX;
+
+        if (heelX > startLineXRatio) {
+          personInAir = true;
+          aiState.innerText = "🏃 運動員跳躍中...";
+        }
+
+        if (personInAir && feetVelocity < 0.0025 && !isCaptured) {
+          isCaptured = true;
+          captureAndAnnotatePhoto(heelX, heelY);
+        }
+      }
+    }
+
+    // 快門繪製照片與數據
+    function captureAndAnnotatePhoto(landingX, landingY) {
+      statusText.innerText = "📸 成功捕捉落地瞬間！";
+      aiState.innerText = "計算成績中...";
+
+      const photoCanvas = document.createElement('canvas');
+      photoCanvas.width = videoElement.videoWidth || 1920;
+      photoCanvas.height = videoElement.videoHeight || 1080;
+      const pCtx = photoCanvas.getContext('2d');
+
+      pCtx.drawImage(videoElement, 0, 0, photoCanvas.width, photoCanvas.height);
+
+      const startX = startLineXRatio * photoCanvas.width;
+      const landX = landingX * photoCanvas.width;
+      const landY = landingY * photoCanvas.height;
+
+      const pixelDist = Math.abs(landX - startX);
+      const distanceCm = (pixelDist * CM_PER_PIXEL).toFixed(1);
+
+      // 起跳線 (紅)
+      pCtx.beginPath();
+      pCtx.strokeStyle = "#ff0055";
+      pCtx.lineWidth = 8;
+      pCtx.moveTo(startX, 0); pCtx.lineTo(startX, photoCanvas.height);
+      pCtx.stroke();
+
+      // 著地線 (黃)
+      pCtx.beginPath();
+      pCtx.strokeStyle = "#ffcc00";
+      pCtx.lineWidth = 8;
+      pCtx.moveTo(landX, 0); pCtx.lineTo(landX, photoCanvas.height);
+      pCtx.stroke();
+
+      // 距離線 (綠虛線)
+      pCtx.beginPath();
+      pCtx.strokeStyle = "#00ff88";
+      pCtx.lineWidth = 6;
+      pCtx.setLineDash([15, 10]);
+      pCtx.moveTo(startX, landY); pCtx.lineTo(landX, landY);
+      pCtx.stroke();
+
+      // 印出標註數字
+      pCtx.fillStyle = "#00ff88";
+      pCtx.font = "bold 56px sans-serif";
+      pCtx.shadowColor = "black";
+      pCtx.shadowBlur = 12;
+      pCtx.fillText(`${distanceCm} cm`, (startX + landX) / 2 - 80, landY - 20);
+
+      document.getElementById('captured-image').src = photoCanvas.toDataURL('image/jpeg');
+      document.getElementById('photo-modal').style.display = 'flex';
+    }
+  </script>
+</body>
+</html>
