@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>陸運會跳遠 WebXR AR 精準測量系統</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100vw; height: 100vh; overflow: hidden;
+      background-color: #000; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    /* AR DOM Overlay 介面層 */
+    #xr-overlay {
+      position: fixed; top: 0; left: 0;
+      width: 100vw; height: 100vh; z-index: 9999;
+      display: flex; flex-direction: column;
+      justify-content: space-between; align-items: center;
+      padding: 25px 20px; pointer-events: none;
+    }
+
+    .interactive { pointer-events: auto; }
+
+    #info-card {
+      background: rgba(0, 0, 0, 0.85); color: #fff;
+      padding: 14px 22px; border-radius: 20px;
+      font-size: 15px; font-weight: bold; text-align: center;
+      max-width: 90%; backdrop-filter: blur(8px);
+      border: 1px solid rgba(255,255,255,0.2);
+      box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+    }
+
+    #controls {
+      display: flex; gap: 12px; width: 100%;
+      max-width: 400px; justify-content: center;
+    }
+
+    .btn {
+      flex: 1; padding: 16px 10px; font-size: 16px; font-weight: 900;
+      color: #fff; border: none; border-radius: 30px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.5); cursor: pointer; text-align: center;
+      transition: all 0.2s;
+    }
+    .btn:active { transform: scale(0.95); }
+
+    #btn-start { background: #007bff; width: 100%; max-width: 220px; }
+    #btn-set-start { background: #ff0055; display: none; }
+    #btn-set-land { background: #00ff88; color: #000; display: none; }
+    #btn-reset { background: #ffcc00; color: #000; display: none; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  </style>
+
+  <!-- Three.js 庫 -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+
+  <!-- AR DOM Overlay -->
+  <div id="xr-overlay">
+    <div id="info-card" class="interactive">請點擊下方「開啟 AR 測量」按鈕</div>
+    <div id="controls" class="interactive">
+      <button id="btn-start" class="btn">開啟 AR 測量</button>
+      <button id="btn-set-start" class="btn">標記起跳線</button>
+      <button id="btn-set-land" class="btn">標記著地點</button>
+      <button id="btn-reset" class="btn">重置</button>
+    </div>
+  </div>
+
+  <script>
+    let camera, scene, renderer;
+    let xrRefSpace, hitTestSource = null;
+    let reticle;
+
+    // AR 空間中的點位座標 (3D Vector)
+    let startLinePos = null;
+    let landingPos = null;
+
+    // 3D 視覺物件
+    let startLineMesh = null;
+    let landingMarkerMesh = null;
+    let distLineMesh = null;
+    let textSprite = null;
+
+    const btnStart = document.getElementById('btn-start');
+    const btnSetStart = document.getElementById('btn-set-start');
+    const btnSetLand = document.getElementById('btn-set-land');
+    const btnReset = document.getElementById('btn-reset');
+    const infoCard = document.getElementById('info-card');
+    const overlay = document.getElementById('xr-overlay');
+
+    // 檢查網頁與 AR 環境
+    window.addEventListener('DOMContentLoaded', () => {
+      if (!window.isSecureContext) {
+        infoCard.style.color = '#ff6b6b';
+        infoCard.innerText = "❌ 錯誤：網址必須是 HTTPS！";
+        btnStart.disabled = true;
+      } else if (!navigator.xr) {
+        infoCard.style.color = '#ff6b6b';
+        infoCard.innerText = "❌ 錯誤：瀏覽器不支援 WebXR (請使用 Android Chrome)";
+        btnStart.disabled = true;
+      }
+    });
+
+    // 啟動 AR Session
+    btnStart.addEventListener('click', async () => {
+      try {
+        infoCard.innerText = "正在初始化 AR 空間...";
+
+        scene = new THREE.Scene();
+        camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.xr.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+        scene.add(light);
+
+        // 準心 (綠色環)
+        const ringGeo = new THREE.RingGeometry(0.04, 0.05, 32).rotateX(-Math.PI / 2);
+        const ringMat = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+        reticle = new THREE.Mesh(ringGeo, ringMat);
+        reticle.matrixAutoUpdate = false;
+        reticle.visible = false;
+        scene.add(reticle);
+
+        // 請求廣域地面 hit-test 與 DOM Overlay 權限
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['hit-test', 'local-floor'],
+          optionalFeatures: ['dom-overlay'],
+          domOverlay: { root: overlay }
+        });
+
+        renderer.xr.setSession(session);
+
+        // 更新 UI
+        btnStart.style.display = 'none';
+        btnSetStart.style.display = 'block';
+        infoCard.innerText = "擺動手機掃描地面，瞄準【起跳線】按「標記起跳線」";
+
+        const viewerSpace = await session.requestReferenceSpace('viewer');
+        hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+        xrRefSpace = await session.requestReferenceSpace('local-floor');
+
+        renderer.setAnimationLoop(render);
+
+      } catch (err) {
+        infoCard.innerText = "開啟 AR 失敗: " + err.message;
+      }
+    });
+
+    function render(timestamp, frame) {
+      if (frame) {
+        const hitTestResults = frame.getHitTestResults(hitTestSource);
+        if (hitTestResults.length > 0) {
+          const hit = hitTestResults[0];
+          const pose = hit.getPose(xrRefSpace);
+          reticle.visible = true;
+          reticle.matrix.fromArray(pose.transform.matrix);
+
+          // 若已定起跳線，即時更新當前準心與起跳線的預覽距離
+          if (startLinePos && !landingPos) {
+            const currentPos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+            const dist = startLinePos.distanceTo(currentPos);
+            infoCard.innerText = `瞄準著地點... (即時距離: ${(dist * 100).toFixed(1)} cm)`;
+          }
+        } else {
+          reticle.visible = false;
+        }
+      }
+      renderer.render(scene, camera);
+    }
+
+    // 1. 標記起跳線
+    btnSetStart.addEventListener('click', () => {
+      if (reticle && reticle.visible) {
+        startLinePos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+
+        // 在 3D 空間建立起跳線 (紅色方條，長 3m)
+        const lineGeo = new THREE.BoxGeometry(3.0, 0.01, 0.04);
+        const lineMat = new THREE.MeshBasicMaterial({ color: 0xff0055 });
+        startLineMesh = new THREE.Mesh(lineGeo, lineMat);
+        startLineMesh.position.copy(startLinePos);
+        scene.add(startLineMesh);
+
+        btnSetStart.style.display = 'none';
+        btnSetLand.style.display = 'block';
+        infoCard.innerText = "🔒 起跳線已鎖定！請瞄準選手【著地點/腳後跟】按「標記著地點」";
+      } else {
+        alert("未掃描到地面！請對著沙坑/地板擺動手機。");
+      }
+    });
+
+    // 2. 標記著地點並測量
+    btnSetLand.addEventListener('click', () => {
+      if (reticle && reticle.visible && startLinePos) {
+        landingPos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+
+        // 建立著地點標記 (黃色小圓柱)
+        const cylinderGeo = new THREE.CylinderGeometry(0.08, 0.08, 0.02, 32);
+        const cylinderMat = new THREE.MeshBasicMaterial({ color: 0xffcc00 });
+        landingMarkerMesh = new THREE.Mesh(cylinderGeo, cylinderMat);
+        landingMarkerMesh.position.copy(landingPos);
+        scene.add(landingMarkerMesh);
+
+        // 計算真實 3D 空間距離 (公尺轉公分)
+        const distMeters = startLinePos.distanceTo(landingPos);
+        const distCm = (distMeters * 100).toFixed(1);
+
+        // 畫連線 (綠線)
+        const points = [startLinePos, landingPos];
+        const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
+        const lineMat = new THREE.LineBasicMaterial({ color: 0x00ff88, linewidth: 5 });
+        distLineMesh = new THREE.Line(lineGeo, lineMat);
+        scene.add(distLineMesh);
+
+        // 在 3D 空間顯示浮動數字看板
+        textSprite = createTextSprite(`${distCm} cm`);
+        textSprite.position.set(
+          (startLinePos.x + landingPos.x) / 2,
+          ((startLinePos.y + landingPos.y) / 2) + 0.2,
+          (startLinePos.z + landingPos.z) / 2
+        );
+        scene.add(textSprite);
+
+        btnSetLand.style.display = 'none';
+        btnReset.style.display = 'block';
+        infoCard.innerText = `🏆 測量完成！成績：${distCm} cm (${distMeters.toFixed(2)} m)`;
+        infoCard.style.color = '#00ff88';
+      }
+    });
+
+    // 3. 重置測量
+    btnReset.addEventListener('click', () => {
+      if (startLineMesh) scene.remove(startLineMesh);
+      if (landingMarkerMesh) scene.remove(landingMarkerMesh);
+      if (distLineMesh) scene.remove(distLineMesh);
+      if (textSprite) scene.remove(textSprite);
+
+      startLinePos = null;
+      landingPos = null;
+
+      btnReset.style.display = 'none';
+      btnSetStart.style.display = 'block';
+      infoCard.style.color = '#ffffff';
+      infoCard.innerText = "已重置。瞄準【起跳線】按「標記起跳線」";
+    });
+
+    // 建立 3D 空間浮動文字
+    function createTextSprite(text) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 512; canvas.height = 256;
+      const ctx = canvas.getContext('2d');
+
+      ctx.fillStyle = "rgba(0, 0, 0, 0.8)";
+      ctx.roundRect(50, 50, 412, 156, 30);
+      ctx.fill();
+
+      ctx.strokeStyle = "#00ff88";
+      ctx.lineWidth = 8;
+      ctx.stroke();
+
+      ctx.font = "Bold 70px sans-serif";
+      ctx.fillStyle = "#00ff88";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(text, 256, 128);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      const spriteMaterial = new THREE.SpriteMaterial({ map: texture });
+      const sprite = new THREE.Sprite(spriteMaterial);
+      sprite.scale.set(0.6, 0.3, 1.0);
+      return sprite;
+    }
+  </script>
+</body>
+</html>
