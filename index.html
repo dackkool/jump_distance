@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>AI 自動跳遠測量系統</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0;
+      width: 100vw; height: 100vh;
+      overflow: hidden; background-color: #000;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    #video-feed {
+      position: absolute; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      object-fit: cover; z-index: 1;
+    }
+
+    #draw-canvas {
+      position: absolute; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      z-index: 2; pointer-events: auto;
+    }
+
+    #ui-container {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      pointer-events: none; z-index: 10;
+      display: flex; flex-direction: column; justify-content: space-between;
+      padding: 16px;
+    }
+
+    .interactive { pointer-events: auto; }
+
+    #status-card {
+      background: rgba(0, 0, 0, 0.8); color: #fff;
+      padding: 14px; border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      text-align: center; backdrop-filter: blur(8px);
+    }
+
+    #status-text { font-size: 15px; font-weight: bold; color: #00ffcc; margin-top: 4px; }
+    #ai-state { font-size: 12px; color: #ffcc00; margin-top: 4px; }
+
+    #photo-preview-modal {
+      display: none; position: fixed; top: 0; left: 0;
+      width: 100vw; height: 100vh; background: rgba(0,0,0,0.9);
+      z-index: 100; flex-direction: column; align-items: center; justify-content: center;
+      padding: 20px;
+    }
+
+    #captured-image {
+      max-width: 100%; max-height: 70vh;
+      border: 2px solid #00ffcc; border-radius: 8px;
+    }
+
+    .btn {
+      background: #00ffcc; color: #000; font-size: 16px; font-weight: bold;
+      border: none; padding: 12px 24px; border-radius: 20px;
+      cursor: pointer; margin-top: 10px;
+    }
+    .btn-reset { background: #ff3b30; color: #fff; }
+  </style>
+
+  <!-- 引入 Google MediaPipe Pose (AI 姿態識別) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+  <!-- 原生相機視訊 -->
+  <video id="video-feed" playsinline muted></video>
+  <!-- 繪圖及 AI 骨架 Overlay -->
+  <canvas id="draw-canvas"></canvas>
+
+  <!-- 介面容器 -->
+  <div id="ui-container">
+    <div id="status-card" class="interactive">
+      <div style="font-size: 12px; color: #aaa;">AI 自動跳遠照片標註系統</div>
+      <div id="status-text">點擊螢幕設定【起跳線】</div>
+      <div id="ai-state">AI 狀態: 準備中...</div>
+      <button id="btn-start-ai" class="btn interactive">開啟 AI 追蹤</button>
+    </div>
+  </div>
+
+  <!-- 自動拍攝後的照片結果 Modal -->
+  <div id="photo-preview-modal">
+    <h3 style="color: #00ffcc; margin: 0 0 10px 0;">📸 已自動捕捉著地畫面！</h3>
+    <img id="captured-image" src="" alt="跳遠紀錄">
+    <button id="btn-close-modal" class="btn btn-reset">重新準備下一跳</button>
+  </div>
+
+  <script>
+    const videoElement = document.getElementById('video-feed');
+    const canvasElement = document.getElementById('draw-canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+
+    let startLineY = null; // 起跳線 Y 軸高度 (Normalized 0~1)
+    let isTracking = false;
+    let poseDetector;
+
+    // AI 著地偵測變數
+    let lastFeetY = 0;
+    let feetVelocity = 0;
+    let inAir = false;
+    let captured = false;
+
+    // 像素對應厘米比例估算 (可依鏡頭角度設定)
+    const CM_PER_PIXEL_RATIO = 0.85; 
+
+    document.getElementById('btn-start-ai').addEventListener('click', initCameraAndAI);
+    canvasElement.addEventListener('click', setStartLine);
+    document.getElementById('btn-close-modal').addEventListener('click', resetForNextJump);
+
+    // 1. 初始化相機與 MediaPipe Pose
+    async function initCameraAndAI() {
+      document.getElementById('btn-start-ai').style.display = 'none';
+      document.getElementById('ai-state').innerText = "AI 啟動中，請允許相機權限...";
+
+      // 設定 Canvas 大小
+      canvasElement.width = window.innerWidth;
+      canvasElement.height = window.innerHeight;
+
+      // 初始化 MediaPipe Pose
+      poseDetector = new Pose({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+      });
+
+      poseDetector.setOptions({
+        modelComplexity: 1, // 1 = 適合手機即時效能
+        smoothLandmarks: true,
+        minDetectionConfidence: 0.6,
+        minTrackingConfidence: 0.6
+      });
+
+      poseDetector.onResults(onPoseResults);
+
+      // 開啟相機
+      const camera = new Camera(videoElement, {
+        onFrame: async () => {
+          if (!captured) {
+            await poseDetector.send({ image: videoElement });
+          }
+        },
+        width: 1280,
+        height: 720
+      });
+      camera.start();
+
+      document.getElementById('ai-state').innerText = "AI 就緒！請先點擊螢幕設置起跳線";
+    }
+
+    // 2. 點擊螢幕設定「起跳線」
+    function setStartLine(e) {
+      if (captured) return;
+      
+      // 紀錄起跳線 Y 軸比例 (0 ~ 1)
+      startLineY = e.clientY / window.innerHeight;
+      
+      document.getElementById('status-text').innerText = "已設定起跳線！等待選手跳遠...";
+      document.getElementById('ai-state').innerText = "AI 正在監測選手著地...";
+    }
+
+    // 3. AI 即時處理每張 Frame
+    function onPoseResults(results) {
+      // 清空 Canvas 並繪製目前畫面
+      canvasCtx.save();
+      canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+      // 畫起跳線 (紅色)
+      if (startLineY !== null) {
+        canvasCtx.beginPath();
+        canvasCtx.strokeStyle = "#ff0055";
+        canvasCtx.lineWidth = 6;
+        canvasCtx.moveTo(0, startLineY * canvasElement.height);
+        canvasCtx.lineTo(canvasElement.width, startLineY * canvasElement.height);
+        canvasCtx.stroke();
+      }
+
+      // 判斷是否偵測到人體
+      if (results.poseLandmarks && startLineY !== null) {
+        const landmarks = results.poseLandmarks;
+
+        // 取得左右腳跟 (Left Heel: 29, Right Heel: 30)
+        const leftHeel = landmarks[29];
+        const rightHeel = landmarks[30];
+
+        // 抓取比較靠後的腳跟位置 (Y軸最大值，畫面越偏下)
+        const currentFeetY = Math.max(leftHeel.y, rightHeel.y);
+        const currentFeetX = leftHeel.y > rightHeel.y ? leftHeel.x : rightHeel.x;
+
+        // 計算腳部運動速度 (前後 Frame 的垂直位移)
+        feetVelocity = Math.abs(currentFeetY - lastFeetY);
+        lastFeetY = currentFeetY;
+
+        // 標註目前腳跟 AI 焦點 (綠色點)
+        canvasCtx.beginPath();
+        canvasCtx.arc(currentFeetX * canvasElement.width, currentFeetY * canvasElement.height, 8, 0, 2 * Math.PI);
+        canvasCtx.fillStyle = "#00ffcc";
+        canvasCtx.fill();
+
+        // --- 🤖 自動拍攝核心邏輯 ---
+        // 條件 A: 腳跟位置已經過起跳線 (Y 軸超出起跳線)
+        if (currentFeetY > startLineY) {
+          inAir = true;
+          document.getElementById('ai-state').innerText = "偵測到跳躍中...";
+        }
+
+        // 條件 B: 曾腾空躍起，且當前腳步速度趨近於零（著地停頓瞬間）
+        if (inAir && feetVelocity < 0.003 && !captured) {
+          captured = true; // 鎖定快門，避免重複觸發
+          triggerAutoCapture(currentFeetX, currentFeetY);
+        }
+      }
+
+      canvasCtx.restore();
+    }
+
+    // 4. 自動觸發快門與生成成績照片
+    function triggerAutoCapture(heelX, heelY) {
+      document.getElementById('status-text').innerText = "🎉 自動拍攝成功！";
+
+      // 建立合併 Canvas 用於導出高畫質照片
+      const photoCanvas = document.createElement('canvas');
+      photoCanvas.width = videoElement.videoWidth || 1280;
+      photoCanvas.height = videoElement.videoHeight || 720;
+      const pCtx = photoCanvas.getContext('2d');
+
+      // 1. 繪製底層當前相機影像
+      pCtx.drawImage(videoElement, 0, 0, photoCanvas.width, photoCanvas.height);
+
+      // 2. 轉換座標
+      const startYPx = startLineY * photoCanvas.height;
+      const landingYPx = heelY * photoCanvas.height;
+      const landingXPx = heelX * photoCanvas.width;
+
+      // 3. 計算距離 (像素轉厘米)
+      const pixelDistance = Math.abs(landingYPx - startYPx);
+      const calculatedDistanceCm = (pixelDistance * CM_PER_PIXEL_RATIO).toFixed(1);
+
+      // 4. 在照片上燒錄：紅顏色【起跳線】
+      pCtx.beginPath();
+      pCtx.strokeStyle = "#ff0055";
+      pCtx.lineWidth = 8;
+      pCtx.moveTo(0, startYPx);
+      pCtx.lineTo(photoCanvas.width, startYPx);
+      pCtx.stroke();
+
+      // 5. 在照片上燒錄：黃顏色【著地線】
+      pCtx.beginPath();
+      pCtx.strokeStyle = "#ffcc00";
+      pCtx.lineWidth = 8;
+      pCtx.moveTo(0, landingYPx);
+      pCtx.lineTo(photoCanvas.width, landingYPx);
+      pCtx.stroke();
+
+      // 6. 在照片上燒錄：綠色【距離連接線】
+      pCtx.beginPath();
+      pCtx.strokeStyle = "#00ff88";
+      pCtx.lineWidth = 6;
+      pCtx.setLineDash([15, 10]); // 虛線
+      pCtx.moveTo(landingXPx, startYPx);
+      pCtx.lineTo(landingXPx, landingYPx);
+      pCtx.stroke();
+
+      // 7. 燒錄距離文字標註
+      pCtx.fillStyle = "#00ff88";
+      pCtx.font = "bold 48px sans-serif";
+      pCtx.shadowColor = "black";
+      pCtx.shadowBlur = 10;
+      pCtx.fillText(`${calculatedDistanceCm} cm`, landingXPx + 20, (startYPx + landingYPx) / 2);
+
+      // 導出圖片並顯示 Modal
+      const resultDataURL = photoCanvas.toDataURL('image/jpeg');
+      document.getElementById('captured-image').src = resultDataURL;
+      document.getElementById('photo-preview-modal').style.display = 'flex';
+    }
+
+    // 5. 重設準備下一位選手
+    function resetForNextJump() {
+      captured = false;
+      inAir = false;
+      document.getElementById('photo-preview-modal').style.display = 'none';
+      document.getElementById('status-text').innerText = "AI 監視中，請選手開始起跳...";
+      document.getElementById('ai-state').innerText = "AI 等待著地瞬間...";
+    }
+  </script>
+</body>
+</html>
