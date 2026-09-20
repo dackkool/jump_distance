@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>陸運會跳遠 AR 量測系統</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      background-color: #000;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    /* 控制面板 overlay */
+    #ui-container {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none; /* 讓點擊事件穿透到 AR 畫布 */
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      box-sizing: border-box;
+      padding: 20px;
+      z-index: 10;
+    }
+
+    .interactive {
+      pointer-events: auto;
+    }
+
+    #status-card {
+      background: rgba(0, 0, 0, 0.75);
+      color: #fff;
+      padding: 12px 20px;
+      border-radius: 12px;
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      text-align: center;
+    }
+
+    #status-title {
+      font-size: 14px;
+      color: #aaa;
+      margin-bottom: 4px;
+    }
+
+    #status-text {
+      font-size: 18px;
+      font-weight: bold;
+      color: #00ffcc;
+    }
+
+    #result-box {
+      display: none;
+      background: rgba(0, 255, 136, 0.2);
+      border: 2px solid #00ff88;
+      border-radius: 12px;
+      padding: 10px;
+      margin-top: 10px;
+      text-align: center;
+    }
+
+    #distance-display {
+      font-size: 32px;
+      font-weight: 900;
+      color: #ffffff;
+      text-shadow: 0 0 10px rgba(0,255,136,0.5);
+    }
+
+    .btn-group {
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      margin-bottom: 20px;
+    }
+
+    button {
+      background: #007aff;
+      color: white;
+      border: none;
+      padding: 14px 24px;
+      font-size: 16px;
+      font-weight: bold;
+      border-radius: 30px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    button:active {
+      transform: scale(0.95);
+    }
+
+    #btn-reset {
+      background: #ff3b30;
+      display: none;
+    }
+
+    /* 隱藏預設 AR 按鈕，改用自訂 */
+    #ARButton {
+      position: absolute !important;
+      bottom: 30px !important;
+      left: 50% !important;
+      transform: translateX(-50%) !important;
+      background: #00ffcc !important;
+      color: #000 !important;
+      font-weight: bold !important;
+      border-radius: 20px !important;
+      padding: 12px 24px !important;
+      border: none !important;
+      z-index: 100;
+    }
+  </style>
+
+  <!-- 引入 Three.js 與 WebXR 相關套件 -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/webxr/ARButton.js"></script>
+</head>
+<body>
+
+  <div id="ui-container">
+    <div id="status-card" class="interactive">
+      <div id="status-title">陸運會 AR 跳遠測量系統</div>
+      <div id="status-text">請點擊下方按鈕啟動 AR 模式</div>
+      <div id="result-box">
+        <div style="font-size: 12px; color: #ddd;">成績即時計算</div>
+        <div id="distance-display">0.0 cm</div>
+      </div>
+    </div>
+
+    <div class="btn-group interactive">
+      <button id="btn-reset">重新量測 (Reset)</button>
+    </div>
+  </div>
+
+  <script>
+    let container;
+    let camera, scene, renderer;
+    let controller;
+
+    let reticle; // 平面瞄準準星
+    let hitTestSource = null;
+    let hitTestSourceRequested = false;
+
+    // 狀態管理：0 = 找平面, 1 = 定起跳線, 2 = 定著地點/完成
+    let appState = 0;
+
+    let startLinePoint = null; // 起跳線位置 (Vector3)
+    let landingPoint = null;   // 著地點位置 (Vector3)
+
+    let startLineMesh = null;
+    let landingLineMesh = null;
+    let distanceLineMesh = null;
+
+    init();
+    animate();
+
+    function init() {
+      container = document.createElement('div');
+      document.body.appendChild(container);
+
+      scene = new THREE.Scene();
+
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+      // 光源設定
+      const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+      light.position.set(0.5, 1, 0.25);
+      scene.add(light);
+
+      // WebGL Renderer 設定
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      container.appendChild(renderer.domElement);
+
+      // 加入 WebXR AR 按鈕
+      document.body.appendChild(ARButton.createButton(renderer, { 
+        requiredFeatures: ['hit-test'] 
+      }));
+
+      // 建立瞄準準星 (Reticle)
+      const ringGeometry = new THREE.RingGeometry(0.08, 0.1, 32).rotateX(-Math.PI / 2);
+      const ringMaterial = new THREE.MeshBasicMaterial({ color: 0x00ffcc, side: THREE.DoubleSide });
+      reticle = new THREE.Mesh(ringGeometry, ringMaterial);
+      reticle.matrixAutoUpdate = false;
+      reticle.visible = false;
+      scene.add(reticle);
+
+      // 觸控點擊事件
+      controller = renderer.xr.getController(0);
+      controller.addEventListener('select', onSelect);
+      scene.add(controller);
+
+      // 重設按鈕事件
+      document.getElementById('btn-reset').addEventListener('click', resetMeasurement);
+
+      window.addEventListener('resize', onWindowResize);
+    }
+
+    function onSelect() {
+      if (!reticle.visible) return;
+
+      // 取得準星當前在 3D 空間的位置
+      const currentPosition = new THREE.Vector3();
+      currentPosition.setFromMatrixPosition(reticle.matrix);
+
+      if (appState === 0) {
+        // --- 1. 設定起跳線 ---
+        startLinePoint = currentPosition.clone();
+        createStartLine(startLinePoint);
+        
+        appState = 1;
+        updateStatus("已設置【起跳線】！\n請點擊選手著地腳跟位置");
+        document.getElementById('btn-reset').style.display = 'block';
+
+      } else if (appState === 1) {
+        // --- 2. 設定著地點並計算距離 ---
+        landingPoint = currentPosition.clone();
+        
+        // 計算垂直距離 (公尺轉公分)
+        // 簡化計算：空間兩點間的直線距離 (如需嚴格垂直線可依據起跳線方向做向量投影)
+        const distanceInMeters = startLinePoint.distanceTo(landingPoint);
+        const distanceInCm = (distanceInMeters * 100).toFixed(1);
+
+        createLandingAndDistanceVisuals(startLinePoint, landingPoint);
+
+        // 顯示結果
+        document.getElementById('result-box').style.display = 'block';
+        document.getElementById('distance-display').innerText = `${distanceInCm} cm`;
+        
+        appState = 2;
+        reticle.visible = false; // 隱藏準星
+        updateStatus("量測完成！可截圖記錄");
+      }
+    }
+
+    // 畫出紅色起跳線 (紅粗線)
+    function createStartLine(position) {
+      const geometry = new THREE.BoxGeometry(2.0, 0.005, 0.05); // 寬2米、貼地
+      const material = new THREE.MeshBasicMaterial({ color: 0xff0055 });
+      startLineMesh = new THREE.Mesh(geometry, material);
+      
+      startLineMesh.position.copy(position);
+      // 旋轉使其平行於相機當前視野
+      startLineMesh.rotation.y = camera.rotation.y; 
+      scene.add(startLineMesh);
+    }
+
+    // 畫出黃色著地線與綠色距離連接線
+    function createLandingAndDistanceVisuals(p1, p2) {
+      // 1. 著地線
+      const landGeo = new THREE.BoxGeometry(1.5, 0.005, 0.03);
+      const landMat = new THREE.MeshBasicMaterial({ color: 0xffcc00 });
+      landingLineMesh = new THREE.Mesh(landGeo, landMat);
+      landingLineMesh.position.copy(p2);
+      landingLineMesh.rotation.y = startLineMesh.rotation.y; // 平行於起跳線
+      scene.add(landingLineMesh);
+
+      // 2. 距離指示線 (綠色虛線/實線)
+      const lineGeo = new THREE.BufferGeometry().setFromPoints([p1, p2]);
+      const lineMat = new THREE.LineBasicMaterial({ color: 0x00ff88, linewidth: 3 });
+      distanceLineMesh = new THREE.Line(lineGeo, lineMat);
+      scene.add(distanceLineMesh);
+    }
+
+    // 重設測量
+    function resetMeasurement(e) {
+      if(e) e.stopPropagation();
+      
+      appState = 0;
+      startLinePoint = null;
+      landingPoint = null;
+
+      if (startLineMesh) scene.remove(startLineMesh);
+      if (landingLineMesh) scene.remove(landingLineMesh);
+      if (distanceLineMesh) scene.remove(distanceLineMesh);
+
+      document.getElementById('result-box').style.display = 'none';
+      document.getElementById('btn-reset').style.display = 'none';
+      
+      updateStatus("請對準沙池地面，點擊畫面設定【起跳線】");
+    }
+
+    function updateStatus(text) {
+      document.getElementById('status-text').innerText = text;
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    function animate() {
+      renderer.setAnimationLoop(render);
+    }
+
+    function render(timestamp, frame) {
+      if (frame) {
+        const referenceSpace = renderer.xr.getReferenceSpace();
+        const session = renderer.xr.getSession();
+
+        // 要求 WebXR Hit Test (平面偵測)
+        if (hitTestSourceRequested === false) {
+          session.requestReferenceSpace('viewer').then((viewerSpace) => {
+            session.requestHitTestSource({ space: viewerSpace }).then((source) => {
+              hitTestSource = source;
+            });
+          });
+
+          session.addEventListener('end', () => {
+            hitTestSourceRequested = false;
+            hitTestSource = null;
+          });
+
+          hitTestSourceRequested = true;
+        }
+
+        // 當正在搜尋平面且狀態在設定階段時
+        if (hitTestSource && appState < 2) {
+          const hitTestResults = frame.getHitTestResults(hitTestSource);
+
+          if (hitTestResults.length > 0) {
+            const hit = hitTestResults[0];
+            const pose = hit.getPose(referenceSpace);
+
+            reticle.visible = true;
+            reticle.matrix.fromArray(pose.transform.matrix);
+
+            if (appState === 0) {
+              updateStatus("已找到地面！點擊螢幕設置【起跳線】");
+            }
+          } else {
+            reticle.visible = false;
+            if (appState === 0) {
+              updateStatus("正在掃描沙池/地面，請緩慢移動鏡頭...");
+            }
+          }
+        }
+      }
+
+      renderer.render(scene, camera);
+    }
+  </script>
+</body>
+</html>
