@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>陸運會跳遠 AI 測量系統 (高清橫屏版)</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0;
+      width: 100vw; height: 100vh;
+      overflow: hidden; background-color: #000;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    #video-feed {
+      position: absolute; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      object-fit: cover; z-index: 1;
+    }
+
+    #draw-canvas {
+      position: absolute; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      z-index: 2; pointer-events: none;
+    }
+
+    #ui-container {
+      position: fixed; top: 0; left: 0;
+      width: 100%; height: 100%;
+      pointer-events: none; z-index: 10;
+      display: flex; flex-direction: column;
+      justify-content: space-between; padding: 15px 25px;
+    }
+
+    .interactive { pointer-events: auto; }
+
+    #top-bar {
+      display: flex; justify-content: space-between; align-items: center;
+      background: rgba(0, 0, 0, 0.8); color: #fff;
+      padding: 10px 20px; border-radius: 30px;
+      backdrop-filter: blur(8px); border: 1px solid rgba(255,255,255,0.2);
+    }
+
+    #status-text { font-size: 16px; font-weight: bold; color: #00ffcc; }
+    #ai-state { font-size: 14px; color: #ffcc00; }
+
+    #action-btn-container {
+      position: absolute; right: 30px; top: 50%;
+      transform: translateY(-50%); display: flex; flex-direction: column; gap: 15px;
+    }
+
+    .btn {
+      background: #00ffcc; color: #000;
+      font-size: 18px; font-weight: 900;
+      border: none; padding: 16px 36px; border-radius: 40px;
+      cursor: pointer; box-shadow: 0 4px 20px rgba(0,255,204,0.5);
+      transition: all 0.2s;
+    }
+    .btn:active { transform: scale(0.95); }
+    .btn-again { background: #ffcc00; color: #000; display: none; }
+
+    /* 相片導出 Modal */
+    #photo-modal {
+      display: none; position: fixed; top: 0; left: 0;
+      width: 100vw; height: 100vh; background: rgba(0,0,0,0.92);
+      z-index: 100; flex-direction: column; align-items: center; justify-content: center;
+      padding: 15px;
+    }
+
+    #captured-image {
+      max-width: 90%; max-height: 75vh;
+      border: 3px solid #00ffcc; border-radius: 12px;
+      box-shadow: 0 0 30px rgba(0,255,204,0.3);
+    }
+  </style>
+
+  <!-- Google MediaPipe Pose 庫 -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+  <!-- 後置鏡頭 -->
+  <video id="video-feed" playsinline muted></video>
+  <!-- 繪圖層 -->
+  <canvas id="draw-canvas"></canvas>
+
+  <!-- UI 介面 -->
+  <div id="ui-container">
+    <div id="top-bar">
+      <div>
+        <span style="font-size: 12px; color: #aaa;">陸運會跳遠 AI 測量系統 (高清橫屏版)</span>
+        <div id="status-text">將【綠色垂直虛線】對準起跳線，點擊 Ready 啟用全螢幕鎖定</div>
+      </div>
+      <div id="ai-state">相機初始化中...</div>
+    </div>
+
+    <div id="action-btn-container" class="interactive">
+      <button id="btn-ready" class="btn">Ready</button>
+      <button id="btn-again" class="btn btn-again">Again</button>
+    </div>
+  </div>
+
+  <!-- 照片彈窗 -->
+  <div id="photo-modal">
+    <h3 style="color: #00ffcc; margin: 0 0 10px 0;">📸 已捕捉運動員落地高清相片！</h3>
+    <img id="captured-image" src="" alt="跳遠紀錄">
+    <button id="btn-modal-again" class="btn btn-again interactive" style="display: block; margin-top: 15px;">Again (測量下一位)</button>
+  </div>
+
+  <script>
+    const videoElement = document.getElementById('video-feed');
+    const canvasElement = document.getElementById('draw-canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+
+    const btnReady = document.getElementById('btn-ready');
+    const btnAgain = document.getElementById('btn-again');
+    const btnModalAgain = document.getElementById('btn-modal-again');
+    const statusText = document.getElementById('status-text');
+    const aiState = document.getElementById('ai-state');
+
+    let isReady = false;
+    let isCaptured = false;
+    let startLineXRatio = 0.35; // 起跳線預設在橫屏畫面 35% 處
+
+    let poseDetector = null;
+    let lastFeetX = 0;
+    let feetVelocity = 0;
+    let personInAir = false;
+
+    // 距離換算比例
+    const CM_PER_PIXEL = 0.75;
+
+    window.addEventListener('load', initApp);
+
+    async function initApp() {
+      resizeCanvas();
+
+      // 1. 初始化 AI 人體骨架偵測
+      poseDetector = new Pose({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+      });
+
+      poseDetector.setOptions({
+        modelComplexity: 1,
+        smoothLandmarks: true,
+        minDetectionConfidence: 0.7, // 高嚴格度過濾非人體物件
+        minTrackingConfidence: 0.7
+      });
+
+      poseDetector.onResults(onPoseResults);
+
+      // 2. 開啟後置鏡頭，要求高解析度（1080p）
+      try {
+        const camera = new Camera(videoElement, {
+          onFrame: async () => {
+            if (isReady && !isCaptured) {
+              await poseDetector.send({ image: videoElement });
+            }
+          },
+          facingMode: 'environment',
+          width: 1920,
+          height: 1080
+        });
+        await camera.start();
+        aiState.innerText = "高清後置鏡頭就續";
+      } catch (e) {
+        aiState.innerText = "❌ 鏡頭錯誤: " + e.message;
+      }
+
+      btnReady.addEventListener('click', handleReady);
+      btnAgain.addEventListener('click', handleAgain);
+      btnModalAgain.addEventListener('click', handleAgain);
+
+      window.addEventListener('resize', resizeCanvas);
+      requestAnimationFrame(renderLoop);
+    }
+
+    function resizeCanvas() {
+      canvasElement.width = window.innerWidth;
+      canvasElement.height = window.innerHeight;
+    }
+
+    // 點擊 "Ready"：強制硬體解鎖並轉為最高畫質橫屏，並鎖定起跳線
+    async function handleReady() {
+      // 嘗試透過全螢幕與 Screen Orientation API 強制轉為高清橫屏
+      try {
+        if (document.documentElement.requestFullscreen) {
+          await document.documentElement.requestFullscreen();
+        }
+        if (screen.orientation && screen.orientation.lock) {
+          await screen.orientation.lock('landscape');
+        }
+      } catch (e) {
+        console.log("螢幕旋轉鎖定提示: ", e.message);
+      }
+
+      // 更新畫面與 AI 狀態
+      resizeCanvas();
+      isReady = true;
+      btnReady.style.display = 'none';
+      btnAgain.style.display = 'block';
+
+      statusText.innerText = "🔒 起跳線已鎖定！AI 正在監控運動員跳遠...";
+      statusText.style.color = "#ff0055";
+      aiState.innerText = "等待運動員起跳...";
+    }
+
+    // 點擊 "Again"：重置狀態
+    function handleAgain() {
+      isReady = false;
+      isCaptured = false;
+      personInAir = false;
+
+      document.getElementById('photo-modal').style.display = 'none';
+      btnReady.style.display = 'block';
+      btnAgain.style.display = 'none';
+
+      statusText.innerText = "將【綠色垂直虛線】對準起跳線，點擊 Ready 啟用全螢幕鎖定";
+      statusText.style.color = "#00ffcc";
+      aiState.innerText = "請按 Ready 鎖定起跳線";
+
+      requestAnimationFrame(renderLoop);
+    }
+
+    // 繪製垂直虛線/實線
+    function renderLoop() {
+      canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+      const xPos = startLineXRatio * canvasElement.width;
+
+      if (!isReady) {
+        // 未 Ready：橫屏專用垂直綠虛線
+        canvasCtx.beginPath();
+        canvasCtx.strokeStyle = "#00ffcc";
+        canvasCtx.lineWidth = 5;
+        canvasCtx.setLineDash([20, 12]);
+        canvasCtx.moveTo(xPos, 0);
+        canvasCtx.lineTo(xPos, canvasElement.height);
+        canvasCtx.stroke();
+        canvasCtx.setLineDash([]);
+      } else if (!isCaptured) {
+        // 已 Ready：紅色鎖定線
+        canvasCtx.beginPath();
+        canvasCtx.strokeStyle = "#ff0055";
+        canvasCtx.lineWidth = 6;
+        canvasCtx.moveTo(xPos, 0);
+        canvasCtx.lineTo(xPos, canvasElement.height);
+        canvasCtx.stroke();
+      }
+
+      if (!isCaptured) {
+        requestAnimationFrame(renderLoop);
+      }
+    }
+
+    // AI 偵測邏輯（過濾非人體）
+    function onPoseResults(results) {
+      if (!isReady || isCaptured) return;
+
+      if (results.poseLandmarks) {
+        const landmarks = results.poseLandmarks;
+
+        // 檢查是否為真實人類（鼻子、左右腳跟的可信度高於 60%）
+        const nose = landmarks[0];
+        const leftHeel = landmarks[29];
+        const rightHeel = landmarks[30];
+
+        const isHumanDetected = (nose.visibility > 0.6) && 
+                                (leftHeel.visibility > 0.6 || rightHeel.visibility > 0.6);
+
+        if (!isHumanDetected) return; // 忽略物體
+
+        aiState.innerText = "🏃 捕捉到運動員！";
+
+        // 抓最靠後的腳跟位置（向右跳躍，取最小 X 座標）
+        const heelX = Math.min(leftHeel.x, rightHeel.x);
+        const heelY = leftHeel.x < rightHeel.x ? leftHeel.y : rightHeel.y;
+
+        feetVelocity = Math.abs(heelX - lastFeetX);
+        lastFeetX = heelX;
+
+        // 1. 人物越過起跳線
+        if (heelX > startLineXRatio) {
+          personInAir = true;
+          aiState.innerText = "🏃 運動員跳躍中...";
+        }
+
+        // 2. 落地停頓，自動拍照
+        if (personInAir && feetVelocity < 0.002 && !isCaptured) {
+          isCaptured = true;
+          captureAndAnnotatePhoto(heelX, heelY);
+        }
+      }
+    }
+
+    // 拍照並在相片上繪製標註
+    function captureAndAnnotatePhoto(landingX, landingY) {
+      statusText.innerText = "📸 成功捕捉落地瞬間！";
+      aiState.innerText = "計算成績中...";
+
+      const photoCanvas = document.createElement('canvas');
+      photoCanvas.width = videoElement.videoWidth || 1920;
+      photoCanvas.height = videoElement.videoHeight || 1080;
+      const pCtx = photoCanvas.getContext('2d');
+
+      // 畫底圖相片
+      pCtx.drawImage(videoElement, 0, 0, photoCanvas.width, photoCanvas.height);
+
+      const startX = startLineXRatio * photoCanvas.width;
+      const landX = landingX * photoCanvas.width;
+      const landY = landingY * photoCanvas.height;
+
+      const pixelDist = Math.abs(landX - startX);
+      const distanceCm = (pixelDist * CM_PER_PIXEL).toFixed(1);
+
+      // 標註【紅色起跳線】
+      pCtx.beginPath();
+      pCtx.strokeStyle = "#ff0055";
+      pCtx.lineWidth = 8;
+      pCtx.moveTo(startX, 0);
+      pCtx.lineTo(startX, photoCanvas.height);
+      pCtx.stroke();
+
+      // 標註【黃色著地線】
+      pCtx.beginPath();
+      pCtx.strokeStyle = "#ffcc00";
+      pCtx.lineWidth = 8;
+      pCtx.moveTo(landX, 0);
+      pCtx.lineTo(landX, photoCanvas.height);
+      pCtx.stroke();
+
+      // 標註【綠色距離線】
+      pCtx.beginPath();
+      pCtx.strokeStyle = "#00ff88";
+      pCtx.lineWidth = 6;
+      pCtx.setLineDash([15, 10]);
+      pCtx.moveTo(startX, landY);
+      pCtx.lineTo(landX, landY);
+      pCtx.stroke();
+
+      // 距離數字
+      pCtx.fillStyle = "#00ff88";
+      pCtx.font = "bold 56px sans-serif";
+      pCtx.shadowColor = "black";
+      pCtx.shadowBlur = 12;
+      pCtx.fillText(`${distanceCm} cm`, (startX + landX) / 2 - 80, landY - 20);
+
+      document.getElementById('captured-image').src = photoCanvas.toDataURL('image/jpeg');
+      document.getElementById('photo-modal').style.display = 'flex';
+    }
+  </script>
+</body>
+</html>
