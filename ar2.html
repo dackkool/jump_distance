@@ -110,7 +110,7 @@
     let lastHitPos = new THREE.Vector3();
     let stableFrameCount = 0;
     const REQUIRED_STABLE_FRAMES = 24; // 約 0.8 秒靜止
-    const MIN_LANDING_DIST_METERS = 1.2; // 最小起跳距離 1.2 米，避開起跳線周圍的誤觸
+    const MIN_LANDING_DIST_METERS = 0.4; // 最小起跳距離 0.4 米，避開起跳線周圍的誤觸
 
     // 3D 物件
     let startLineMesh = null;
@@ -275,7 +275,7 @@
               }
             } else {
               stableFrameCount = 0;
-              infoCard.innerText = "🏃‍♂️ 等待運動員跳躍... (目標須距離起跳線 1.2m 以上)";
+              infoCard.innerText = "🏃‍♂️ 等待運動員跳躍... (目標須距離起跳線 0.4 m 以上)";
             }
 
             lastHitPos.copy(currentHitPos);
